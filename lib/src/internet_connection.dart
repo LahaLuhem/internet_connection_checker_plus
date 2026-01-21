@@ -92,6 +92,7 @@ class InternetConnection {
     List<InternetCheckOption>? customCheckOptions,
     bool useDefaultOptions = true,
     this.enableStrictCheck = false,
+    this.slowConnectionConfig,
     this.customConnectivityCheck,
   })  : _checkInterval = checkInterval ?? _defaultCheckInterval,
         assert(
@@ -150,6 +151,8 @@ class InternetConnection {
   /// outages.
   final bool enableStrictCheck;
 
+  final SlowConnectionConfig? slowConnectionConfig;
+
   /// Function to check reachability of a single network endpoint.
   ///
   /// This can be customized to allow for different ways of checking
@@ -170,18 +173,26 @@ class InternetConnection {
   /// Returns a [Future] that completes with an [InternetCheckResult] indicating
   /// whether the host is reachable or not.
   Future<InternetCheckResult> _checkReachabilityFor(InternetCheckOption option) async {
+    final stopwatch = Stopwatch()..start();
     try {
       if (customConnectivityCheck != null) return customConnectivityCheck!(option);
+
       final response = await http.head(option.uri, headers: option.headers).timeout(option.timeout);
+      final responseTime = stopwatch.elapsed;
+      stopwatch.stop();
 
       return InternetCheckResult(
         option: option,
         isSuccess: option.responseStatusFn(response),
+        responseTime: responseTime,
       );
     } catch (_) {
+      stopwatch.stop();
+
       return InternetCheckResult(
         option: option,
         isSuccess: false,
+        responseTime: stopwatch.elapsed,
       );
     }
   }
@@ -209,9 +220,7 @@ class InternetConnection {
 
   /// Checks internet access in strict mode (all endpoints must succeed)
   Future<bool> _hasInternetAccessStrict() async {
-    final results = await Future.wait(
-      _internetCheckOptions.map(_checkReachabilityFor),
-    );
+    final results = await Future.wait(_internetCheckOptions.map(_checkReachabilityFor));
 
     return results.every((result) => result.isSuccess);
   }
@@ -237,8 +246,71 @@ class InternetConnection {
   ///
   /// Returns a [Future] that completes with the [InternetStatus] indicating
   /// the current internet connection status.
-  Future<InternetStatus> get internetStatus async =>
-      await hasInternetAccess ? InternetStatus.connected : InternetStatus.disconnected;
+  /// Returns the current internet connection status.
+  Future<InternetStatus> get internetStatus async {
+    if (slowConnectionConfig == null) {
+      // No slow connection detection - use simple boolean check
+      return await hasInternetAccess ? InternetStatus.connected : InternetStatus.disconnected;
+    }
+    final slowConnectionThreshold = slowConnectionConfig!.slowConnectionThreshold;
+
+    return enableStrictCheck
+        ? await _internetStatusWithSlowDetectionStrict(
+            slowConnectionThreshold: slowConnectionThreshold)
+        : await _internetStatusWithSlowDetectionNonStrict(
+            slowConnectionThreshold: slowConnectionThreshold);
+  }
+
+  /// Determines internet status with slow detection in strict mode
+  Future<InternetStatus> _internetStatusWithSlowDetectionStrict({
+    required Duration slowConnectionThreshold,
+  }) async {
+    final results = await Future.wait(_internetCheckOptions.map(_checkReachabilityFor));
+
+    // Check if all endpoints succeeded
+    final allSucceeded = results.every((result) => result.isSuccess);
+    if (!allSucceeded) return InternetStatus.disconnected;
+
+    // Check for slow connection
+    final anySlow = results.any(
+        (result) => result.responseTime != null && result.responseTime! > slowConnectionThreshold);
+
+    return anySlow ? InternetStatus.slow : InternetStatus.connected;
+  }
+
+  /// Determines internet status with slow detection in non-strict mode
+  Future<InternetStatus> _internetStatusWithSlowDetectionNonStrict({
+    required Duration slowConnectionThreshold,
+  }) async {
+    final futures = _internetCheckOptions.map(_checkReachabilityFor);
+
+    bool foundFastConnection = false;
+    bool foundAnyConnection = false;
+
+    for (final future in futures) {
+      try {
+        final result = await future;
+        if (result.isSuccess) {
+          foundAnyConnection = true;
+
+          // Check if this connection is fast
+          if (result.responseTime != null && result.responseTime! <= slowConnectionThreshold) {
+            foundFastConnection = true;
+          }
+        }
+      } catch (_) {
+        continue;
+      }
+
+      // Early return: if we found a fast connection, return connected immediately
+      if (foundFastConnection) return InternetStatus.connected;
+    }
+
+    // We found connections but they were all slow
+    if (foundAnyConnection) return InternetStatus.slow;
+
+    return InternetStatus.disconnected;
+  }
 
   /// Internal method for emitting status updates.
   ///
